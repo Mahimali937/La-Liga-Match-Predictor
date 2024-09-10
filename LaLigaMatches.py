@@ -1,73 +1,86 @@
-import requests
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score
+from sklearn.metrics import accuracy_score
 import pandas as pd
-from bs4 import BeautifulSoup
-import time
+matches = pd.read_csv("matches.csv", index_col=0)
+matches["date"] = pd.to_datetime(matches["date"])
+matches["venue_code"] = matches["venue"].astype("category").cat.codes
+matches["opp_code"] = matches["opponent"].astype("category").cat.codes
+matches["hour"] = matches["time"].str.replace(
+    ":.+", "", regex=True).astype("int")
+matches["day_code"] = matches["date"].dt.dayofweek
+matches["target"] = (matches["result"] == "W").astype("int")
+rf = RandomForestClassifier(
+    n_estimators=100, min_samples_split=10, random_state=1)
+train = matches[matches["date"] < '2024-01-01']
+test = matches[matches["date"] > '2024-01-01']
+predictors = ["venue_code", "opp_code", "hour", "day_code"]
+rf.fit(train[predictors], train["target"])
+RandomForestClassifier(min_samples_split=10, n_estimators=100, random_state=1)
+preds = rf.predict(test[predictors])
+acc = accuracy_score(test["target"], preds)
+acc
+combined = pd.DataFrame(dict(actual=test["target"], prediction=preds))
+pd.crosstab(index=combined["actual"], columns=combined["prediction"])
+precision_score(test["target"], preds)
+grouped_matches = matches.groupby("team")
+group = grouped_matches.get_group("Barcelona").sort_values("date")
 
-standings_url = 'https://fbref.com/en/comps/12/La-Liga-Stats'
-standings_data = requests.get(standings_url)
-soup = BeautifulSoup(standings_data.text, 'lxml')
-standings_table = soup.select('table.stats_table')[0]
-links = [l.get('href') for l in standings_table.find_all('a')]
-links = [l for l in links if '/squads' in l]
-team_urls = [f"https://fbref.com{l}" for l in links]
-team_url = team_urls[3]
-data = requests.get(team_url)
-matches = pd.read_html(data.text, match='Scores & Fixtures')[0]
-soup = BeautifulSoup(data.text, 'lxml')
-links = [l.get('href') for l in soup.find_all('a')]
-links = [l for l in links if l and '/all_comps/shooting/' in l]
-shooting_data = requests.get(f"https://fbref.com{links[0]}")
-shooting = pd.read_html(shooting_data.text, match='Shooting')[0]
-shooting.columns = shooting.columns.droplevel()
-team_data = matches.merge(
-    shooting[['Date', 'Sh', 'SoT', 'SoT%', 'G/Sh', 'Dist', 'FK', 'PK', 'PKatt']], on="Date")
-team_name = team_url.split('/')[-1].replace('-Stats', '').replace('-', " ")
-team_data = team_data[team_data['Comp'] == 'La Liga']
-years = list(range(2024, 2019, -1))
-all_matches = []
-standings_url = 'https://fbref.com/en/comps/12/La-Liga-Stats'
-for year in years:
-    standings_data = requests.get(standings_url)
-    soup = BeautifulSoup(standings_data.text, 'lxml')
-    standings_table = soup.select('table.stats_table')[0]
 
-    links = [l.get('href') for l in standings_table.find_all('a')]
-    links = [l for l in links if '/squads' in l]
-    team_urls = [f"https://fbref.com{l}" for l in links]
+def rolling_averages(group, cols, new_cols):
+    group = group.sort_values("date")
+    rolling_stats = group[cols].rolling(3, closed='left').mean()
+    group[new_cols] = rolling_stats
+    group = group.dropna(subset=new_cols)
+    return group
 
-    previous_season = soup.select("a.prev")[0].get("href")
-    standings_url = f"https://fbref.com{previous_season}"
 
-    for team_url in team_urls:
-        team_name = team_url.split(
-            "/")[-1].replace("-Stats", "").replace("-", " ")
+cols = ["gf", "ga", "sh", "sot", "dist", "fk", "pk", "pkatt"]
+new_cols = [f"{c}_rolling" for c in cols]
+rolling_averages(group, cols, new_cols)
+matches_rolling = matches.groupby("team").apply(
+    lambda x: rolling_averages(x, cols, new_cols))
+matches_rolling = matches_rolling.droplevel('team')
+matches_rolling.index = range(matches_rolling.shape[0])
+matches_rolling
 
-        data = requests.get(team_url)
-        try:
-            matches = pd.read_html(data.text, match='Scores & Fixtures')[0]
-        except ValueError:
-            continue
-        time.sleep(5)
-        soup = BeautifulSoup(data.text, 'lxml')
-        links = [l.get('href') for l in soup.find_all('a')]
-        links = [l for l in links if l and '/all_comps/shooting/' in l]
 
-        shooting_data = requests.get(f"https://fbref.com{links[0]}")
-        shooting = pd.read_html(shooting_data.text, match='Shooting')[0]
-        shooting.columns = shooting.columns.droplevel()
+def make_predictions(data, predictors):
+    train = data[data["date"] < '2024-01-01']
+    test = data[data["date"] > '2024-01-01']
+    rf.fit(train[predictors], train["target"])
+    preds = rf.predict(test[predictors])
+    combined = pd.DataFrame(
+        dict(actual=test["target"], prediction=preds), index=test.index)
+    precision = precision_score(test["target"], preds)
+    return combined, precision
 
-        try:
-            team_data = matches.merge(
-                shooting[['Date', 'Sh', 'SoT', 'SoT%', 'G/Sh', 'Dist', 'FK', 'PK', 'PKatt']], on="Date")
-        except ValueError:
-            continue
 
-        team_data = team_data[team_data['Comp'] == 'La Liga']
-        team_data['Season'] = year
-        team_data['team'] = team_name
-        all_matches.append(team_data)
-        time.sleep(5)
+combined, precision = make_predictions(matches_rolling, predictors + new_cols)
+precision
+combined
+combined = combined.merge(matches_rolling[[
+                          "date", "team", "opponent", "result"]], left_index=True, right_index=True)
+combined
 
-match_df = pd.concat(all_matches)
-match_df.columns = [c.lower() for c in match_df.columns]
-match_df.to_csv("matches.csv")
+
+class MissingDict(dict):
+    def __missing__(self, key): return key
+
+
+map_values = {
+    "Real Madrid": "Real MA",
+    "Atletico Madrid": "Atletico",
+    "Athletic Club": "Athletic",
+    "Real Sociedad": "Sociedad",
+    "Real Betis": "Betis",
+    "Celta Vigo": "Celta",
+    "Las Palmas": "Palmas",
+    "Rayo Vallecano": "Rayo"
+}
+mapping = MissingDict(**map_values)
+combined["new_team"] = combined["team"].map(mapping)
+combined
+merged = combined.merge(
+    combined, left_on=["date", "new_team"], right_on=["date", "opponent"])
+merged
